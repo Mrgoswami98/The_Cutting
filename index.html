@@ -428,13 +428,14 @@ const APP = {
     cropPad: 3,                // pt
     gapThreshold: 8,          // pt of blank space that separates blocks
     sampleDetect: true,        // detect geometry on first pages, reuse if identical
+  splitGrid: true,           // split sheets that carry several labels side by side
     manualBox: { l: 0, t: 0, r: 0, b: 0 },
     dateOrder: "dmy",
     buckets: [[0, 1], [2, 3], [4, 7], [8, 15], [16, 99999]],
     vendors: [
       { name: "Shadowfax", pattern: "shadowfax|\\bSF\\d{8,}FKA\\b" },
       { name: "E-Kart", pattern: "e-?kart|\\bFMP[A-Z]\\d{8,}\\b" },
-      { name: "Delhivery", pattern: "delhivery" },
+      { name: "Delhivery", pattern: "delhivery|LRN[:\\s]*\\d{6,}" },
       { name: "Ecom Express", pattern: "ecom\\s*express" },
       { name: "Blue Dart", pattern: "blue\\s*dart" },
       { name: "XpressBees", pattern: "xpressbees" },
@@ -443,8 +444,8 @@ const APP = {
       { name: "India Post", pattern: "india\\s*post|speed\\s*post" },
       { name: "Amazon Shipping", pattern: "amazon\\s*(shipping|transportation)" }
     ],
-    rxOrder: "\\bOD\\d{12,}\\b|Order\\s*(?:Id|ID|No)[.:\\s]+([A-Z0-9][A-Z0-9-]{7,})",
-    rxAwb: "AWB\\s*(?:No\\.?|Number)?[:\\s]*([A-Z0-9-]{8,})|Tracking\\s*ID[:\\s]*([A-Z0-9-]{8,})"
+    rxOrder: "\\bOD\\d{12,}\\b||Order\\s*(?:Id|ID|No)[.:\\s]+([A-Z0-9][A-Z0-9-]{7,})||OID[:\\s]+(\\S+)",
+    rxAwb: "AWB\\s*(?:No\\.?|Number)?[:\\s]*([A-Z0-9-]{8,})||Tracking\\s*ID[:\\s]*([A-Z0-9-]{8,})||Master[:\\s]+([A-Z0-9]{8,})||LRN[:\\s]+(\\d{6,})"
   },
   filters: { vendor: "", from: "", to: "", status: "", q: "" }
 };
@@ -478,13 +479,20 @@ function detectVendor(text) {
   }
   return "Unassigned";
 }
+/* Patterns are separated by "||" and tried in that order, so the first one that
+   hits wins regardless of where it sits on the label. A plain "|" inside one
+   pattern still works as ordinary regex alternation. */
 function firstMatch(text, pattern) {
-  try {
-    const m = text.match(new RegExp(pattern, "i"));
-    if (!m) return "";
-    for (let i = 1; i < m.length; i++) if (m[i]) return m[i].trim();
-    return m[0].trim();
-  } catch (e) { return ""; }
+  for (const pat of String(pattern).split("||")) {
+    if (!pat.trim()) continue;
+    try {
+      const m = text.match(new RegExp(pat.trim(), "i"));
+      if (!m) continue;
+      for (let i = 1; i < m.length; i++) if (m[i]) return m[i].trim();
+      return m[0].trim();
+    } catch (e) { /* a bad pattern just does not match */ }
+  }
+  return "";
 }
 
 /* Rebuild text lines from pdf.js text items, keeping x positions. */
@@ -536,75 +544,148 @@ function extractItems(lines) {
    have wider blank bands inside it. One fixed threshold cannot serve both, so the
    gap is tried from wide to narrow and the first value that actually separates the
    sheet into parts wins. */
-function splitBlocks(rowOk, H, gapPx) {
-  const rows = []; for (let y = 0; y < H; y++) if (rowOk[y]) rows.push(y);
-  if (!rows.length) return [];
-  const out = []; let start = rows[0], prev = rows[0];
-  for (let k = 1; k < rows.length; k++) {
-    if (rows[k] - prev > gapPx) { out.push([start, prev]); start = rows[k]; }
-    prev = rows[k];
+function splitBlocks(ok, N, gapPx) {
+  const idx = []; for (let i = 0; i < N; i++) if (ok[i]) idx.push(i);
+  if (!idx.length) return [];
+  const out = []; let start = idx[0], prev = idx[0];
+  for (let k = 1; k < idx.length; k++) {
+    if (idx[k] - prev > gapPx) { out.push([start, prev]); start = idx[k]; }
+    prev = idx[k];
   }
   out.push([start, prev]);
   return out;
 }
-function detectBox(canvas, ctx, pw, ph, mode) {
+
+/* Read the page once into a 1-bit ink map, then measure everything from that. */
+function inkMap(canvas, ctx) {
   const W = canvas.width, H = canvas.height;
-  const sx = pw / W, sy = ph / H;
-  const img = ctx.getImageData(0, 0, W, H).data;
-  const rowCount = new Int32Array(H);
-  const rowMin = new Int32Array(H).fill(W), rowMax = new Int32Array(H).fill(-1);
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const ink = new Uint8Array(W * H);
   for (let y = 0; y < H; y++) {
-    const base = y * W * 4;
+    const base = y * W * 4, row = y * W;
     for (let x = 0; x < W; x++) {
       const i = base + x * 4;
-      if (img[i + 3] > 32 && (img[i] < 170 || img[i + 1] < 170 || img[i + 2] < 170)) {
-        rowCount[y]++;
-        if (x < rowMin[y]) rowMin[y] = x;
-        if (x > rowMax[y]) rowMax[y] = x;
+      if (d[i + 3] > 32 && (d[i] < 170 || d[i + 1] < 170 || d[i + 2] < 170)) ink[row + x] = 1;
+    }
+  }
+  return { ink, W, H };
+}
+function rowProfile(M, x0, x1) {
+  const out = new Int32Array(M.H);
+  for (let y = 0; y < M.H; y++) { const row = y * M.W; let c = 0; for (let x = x0; x <= x1; x++) c += M.ink[row + x]; out[y] = c; }
+  return out;
+}
+function colProfile(M, y0, y1) {
+  const out = new Int32Array(M.W);
+  for (let y = y0; y <= y1; y++) { const row = y * M.W; for (let x = 0; x < M.W; x++) out[x] += M.ink[row + x]; }
+  return out;
+}
+function tighten(M, x0, x1, y0, y1) {
+  let l = x1, r = x0, t = y1, b = y0, found = false;
+  for (let y = y0; y <= y1; y++) {
+    const row = y * M.W;
+    for (let x = x0; x <= x1; x++) if (M.ink[row + x]) {
+      found = true;
+      if (x < l) l = x; if (x > r) r = x;
+      if (y < t) t = y; if (y > b) b = y;
+    }
+  }
+  return found ? { l, r, t, b } : null;
+}
+
+/* Where does the label end and the invoice begin?
+   A framed label keeps its left and right border lines running all the way down,
+   so the blank band under it can be as thin as 3-4pt, while an unframed label can
+   have wider blank bands inside it. One fixed threshold cannot serve both, so the
+   gap is tried from wide to narrow and the tightest result that still looks like a
+   whole label wins. */
+function pickBlock(M, prof, x0, x1, sy, mode) {
+  const minInk = Math.max(2, Math.round((x1 - x0 + 1) * 0.003));
+  const ok = new Uint8Array(M.H);
+  let first = -1, last = -1;
+  for (let y = 0; y < M.H; y++) if (prof[y] >= minInk) { ok[y] = 1; if (first < 0) first = y; last = y; }
+  if (first < 0) return null;
+  const totalH = last - first + 1;
+  if (mode === "trim") return [first, last];
+  const ladder = [APP.settings.gapThreshold, 6, 4, 3].map(g => Math.max(2, Math.round(g / sy)));
+  const floor = Math.max(M.H * 0.14, totalH * 0.18);
+  const cands = [];
+  ladder.forEach(gapPx => {
+    const bs = splitBlocks(ok, M.H, gapPx).filter(b => (b[1] - b[0]) > M.H * 0.04);
+    if (bs.length < 2) return;
+    let cand;
+    if (mode === "biggest") {
+      cand = bs.map(b => { let ink = 0; for (let y = b[0]; y <= b[1]; y++) ink += prof[y]; return { b, ink }; })
+        .sort((p, q) => q.ink - p.ink)[0].b;
+    } else cand = bs[0];
+    const h = cand[1] - cand[0] + 1;
+    if (h >= floor && h <= totalH * 0.9) cands.push({ b: cand, h });
+  });
+  if (cands.length) { cands.sort((p, q) => p.h - q.h); return cands[0].b; }
+  return [first, last];
+}
+
+/* Some couriers print several labels on one sheet (Delhivery B2B box labels, 2-up
+   and 4-up A4 sheets). Those sit in a regular grid separated by clean blank
+   channels, so look for the grid first and fall back to the single-label reading
+   when the page does not actually hold one. */
+function detectBoxes(canvas, ctx, pw, ph, mode) {
+  const M = inkMap(canvas, ctx);
+  const sx = pw / M.W, sy = ph / M.H;
+  const pad = APP.settings.cropPad;
+  const toPts = c => ({
+    l: Math.max(0, c.l * sx - pad), t: Math.max(0, c.t * sy - pad),
+    r: Math.min(pw, (c.r + 1) * sx + pad), b: Math.min(ph, (c.b + 1) * sy + pad)
+  });
+
+  if (APP.settings.splitGrid && mode !== "trim") {
+    const cols = colProfile(M, 0, M.H - 1);
+    const colOk = new Uint8Array(M.W);
+    const minCol = Math.max(2, Math.round(M.H * 0.004));
+    for (let x = 0; x < M.W; x++) if (cols[x] >= minCol) colOk[x] = 1;
+    const gapX = Math.max(3, Math.round(APP.settings.gapThreshold / sx));
+    const bands = splitBlocks(colOk, M.W, gapX).filter(b => (b[1] - b[0]) > M.W * 0.12);
+    if (bands.length >= 2) {
+      /* A real grid is regular: every column the same width, within a tenth. */
+      const widths = bands.map(b => b[1] - b[0]);
+      const wMin = Math.min.apply(null, widths), wMax = Math.max.apply(null, widths);
+      if (wMin / wMax >= 0.85) {
+        const cells = [];
+        bands.forEach(bd => {
+          const prof = rowProfile(M, bd[0], bd[1]);
+          const minInk = Math.max(2, Math.round((bd[1] - bd[0]) * 0.004));
+          const ok = new Uint8Array(M.H);
+          for (let y = 0; y < M.H; y++) if (prof[y] >= minInk) ok[y] = 1;
+          const gapY = Math.max(3, Math.round(APP.settings.gapThreshold / sy));
+          splitBlocks(ok, M.H, gapY)
+            .filter(rb => (rb[1] - rb[0]) > M.H * 0.08)
+            .forEach(rb => {
+              const t = tighten(M, bd[0], bd[1], rb[0], rb[1]);
+              if (!t) return;
+              let area = 0;
+              for (let y = t.t; y <= t.b; y++) { const row = y * M.W; for (let x = t.l; x <= t.r; x++) area += M.ink[row + x]; }
+              if (area > (M.W * M.H) * 0.0015) cells.push({ c: t, area });
+            });
+        });
+        if (cells.length >= 2) {
+          cells.sort((p, q) => (p.c.t - q.c.t) || (p.c.l - q.c.l));   // reading order
+          return cells.map(x => toPts(x.c));
+        }
       }
     }
   }
-  const minInk = Math.max(2, Math.round(W * 0.003));
-  const rowOk = new Uint8Array(H);
-  let first = -1, last = -1;
-  for (let y = 0; y < H; y++) if (rowCount[y] >= minInk) { rowOk[y] = 1; if (first < 0) first = y; last = y; }
-  if (first < 0) return null;
-  const totalH = last - first + 1;
 
-  let blk = [first, last], blocks = 1;
-  if (mode !== "trim") {
-    const ladder = [APP.settings.gapThreshold, 6, 4, 3].map(g => Math.max(2, Math.round(g / sy)));
-    const floor = Math.max(H * 0.14, totalH * 0.18);   // a label is never a thin sliver
-    const cands = [];
-    ladder.forEach(gapPx => {
-      const bs = splitBlocks(rowOk, H, gapPx).filter(b => (b[1] - b[0]) > H * 0.04);
-      if (bs.length < 2) return;
-      let cand;
-      if (mode === "biggest") {
-        cand = bs.map(b => { let ink = 0; for (let y = b[0]; y <= b[1]; y++) ink += rowCount[y]; return { b, ink }; })
-          .sort((p, q) => q.ink - p.ink)[0].b;
-      } else cand = bs[0];                       // auto / top: the label is the first block
-      const h = cand[1] - cand[0] + 1;
-      if (h >= floor && h <= totalH * 0.9) cands.push({ b: cand, h, n: bs.length });
-    });
-    /* The tightest crop that still looks like a whole label wins: a wide gap stops
-       at the first blank band and can swallow the invoice header with it. */
-    if (cands.length) { cands.sort((p, q) => p.h - q.h); blk = cands[0].b; blocks = cands[0].n; }
-  }
-
-  let x0 = W, x1 = -1;
-  for (let y = blk[0]; y <= blk[1]; y++) if (rowOk[y] && rowMax[y] >= 0) { if (rowMin[y] < x0) x0 = rowMin[y]; if (rowMax[y] > x1) x1 = rowMax[y]; }
-  if (x1 < 0) return null;
-  const p = APP.settings.cropPad;
-  return {
-    l: Math.max(0, x0 * sx - p), t: Math.max(0, blk[0] * sy - p),
-    r: Math.min(pw, (x1 + 1) * sx + p), b: Math.min(ph, (blk[1] + 1) * sy + p),
-    blocks: blocks
-  };
+  const prof = rowProfile(M, 0, M.W - 1);
+  const blk = pickBlock(M, prof, 0, M.W - 1, sy, mode);
+  if (!blk) return [];
+  const t = tighten(M, 0, M.W - 1, blk[0], blk[1]);
+  return t ? [toPts(t)] : [];
 }
-const boxKey = b => b ? [b.l, b.t, b.r, b.b].map(v => Math.round(v / 2) * 2).join("|") : "none";
 
-/* ---------------- PDF ingestion ---------------- */
+const boxKey = b => b ? [b.l, b.t, b.r, b.b].map(v => Math.round(v / 2) * 2).join("|") : "none";
+const boxesKey = bs => (bs && bs.length) ? bs.map(boxKey).join(" ~ ") : "none";
+const labelKey = l => l.file + "#" + l.page + "#" + (l.cell || 0);
+
 function startPdfWorker() {
   const el = document.getElementById("pdfWorkerSrc");
   if (!el) return "fake";
@@ -627,7 +708,7 @@ async function ingestPdfs(files) {
   clearSample();
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  let total = 0, done = 0;
+  let total = 0, done = 0, units = 0;
   const docs = [];
 
   setProgress(0, "Opening files…");
@@ -645,97 +726,113 @@ async function ingestPdfs(files) {
   for (const D of docs) {
     const fileRec = { name: D.f.name, bytes: D.bytes, pages: D.doc.numPages, boxes: [] };
     APP.pdfFiles.push(fileRec);
-    let lockedBox = null, probe = [], noText = 0;
+    let lockedBoxes = null, probe = [], noText = 0, gridPages = 0;
 
     for (let p = 1; p <= D.doc.numPages; p++) {
       const page = await D.doc.getPage(p);
       const vp1 = page.getViewport({ scale: 1 });
       const pw = vp1.width, ph = vp1.height;
 
-      /* --- text --- */
       const tc = await page.getTextContent();
       const lines = linesFromItems(tc.items, ph);
-      const text = lines.map(l => l.text).join("\n");
-      /* Rotated runs (the AWB strip down the side of a courier label) do not sit on
-         any horizontal line, so also keep the raw content-stream order. */
-      const raw = tc.items.map(i => i.str).join(" ").replace(/\s+/g, " ");
-      const hay = text + "\n" + raw;
-      if (!text.trim()) noText++;
+      const pageText = lines.map(l => l.text).join("\n");
+      if (!pageText.trim()) noText++;
 
-      /* --- geometry --- */
-      let box = lockedBox;
+      /* --- geometry: one box per label on the sheet --- */
+      let boxes = lockedBoxes;
       if (APP.settings.cropMode === "manual") {
         const mb = APP.settings.manualBox;
-        box = { l: mb.l, t: mb.t, r: pw - mb.r, b: ph - mb.b };
-      } else if (!box) {
+        boxes = [{ l: mb.l, t: mb.t, r: pw - mb.r, b: ph - mb.b }];
+      } else if (!boxes) {
         const scale = Math.min(1.6, 900 / Math.max(pw, ph));
         const vp = page.getViewport({ scale });
         canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
         ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
         await page.render({ canvasContext: ctx, viewport: vp, background: "#ffffff" }).promise;
-        box = detectBox(canvas, ctx, pw, ph, APP.settings.cropMode);
-        if (APP.settings.sampleDetect && APP.settings.cropMode !== "manual") {
-          probe.push(boxKey(box));
+        boxes = detectBoxes(canvas, ctx, pw, ph, APP.settings.cropMode);
+        if (APP.settings.sampleDetect) {
+          probe.push(boxesKey(boxes));
           if (probe.length === 5) {
             const tally = {};
             probe.forEach(k => tally[k] = (tally[k] || 0) + 1);
-            const best = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
-            if (best[1] >= 4) { lockedBox = box; log(`${D.f.name}: label sits in the same place on every page — measuring once (fast mode)`, "ok"); }
-            else log(`${D.f.name}: label position varies — measuring every page`, "warn");
+            const best = Object.entries(tally).sort((x, y) => y[1] - x[1])[0];
+            if (best[1] >= 4) { lockedBoxes = boxes; log(`${D.f.name}: labels sit in the same place on every page — measuring once (fast mode)`, "ok"); }
+            else log(`${D.f.name}: label positions vary — measuring every page`, "warn");
           }
         }
       }
-      fileRec.boxes.push(box);
+      if (!boxes || !boxes.length) boxes = [{ l: 0, t: 0, r: pw, b: ph }];
+      if (boxes.length > 1) gridPages++;
+      fileRec.boxes.push(boxes);
 
-      /* --- fields --- */
-      const vendor = detectVendor(hay);
-      const orderId = firstMatch(hay, APP.settings.rxOrder);
-      const awb = firstMatch(hay, APP.settings.rxAwb);
-      const cust = (text.match(/Name:\s*(.+)/i) || [, ""])[1].replace(/,\s*$/, "").trim();
-      const addr = text.match(/([A-Za-z][A-Za-z .]{1,40}?)\s*-\s*(\d{6})\s*,?\s*(IN-[A-Z]{2})?/);
-      const printed = text.match(/Printed at\s+(\d{3,4})\s*hrs,\s*([\d/]+)/i);
-      const items = extractItems(lines);
-      const base = {
-        file: D.f.name, page: p, vendor, orderId, awb,
-        customer: cust, city: addr ? addr[1].trim() : "", pin: addr ? addr[2] : "", state: addr && addr[3] ? addr[3] : "",
-        printedOn: printed ? printed[2] : "", hasText: !!text.trim(), box
-      };
-      if (items.length) items.forEach(it => APP.labels.push(Object.assign({}, base, it)));
-      else APP.labels.push(Object.assign({}, base, { sku: "", product: "", qty: 1 }));
+      /* --- fields, read inside each label's own rectangle --- */
+      const rawAll = tc.items.map(i => i.str).join(" ").replace(/\s+/g, " ");
+      boxes.forEach((bx, ci) => {
+        let text, hay;
+        if (boxes.length === 1) { text = pageText; hay = pageText + "\n" + rawAll; }
+        else {
+          const inside = lines.filter(L => L.y >= bx.t - 2 && L.y <= bx.b + 2 &&
+            L.parts.some(pt => pt.x >= bx.l - 2 && pt.x <= bx.r + 2));
+          text = inside.map(L => L.parts.filter(pt => pt.x >= bx.l - 2 && pt.x <= bx.r + 2).map(pt => pt.s).join(" ").replace(/\s+/g, " ").trim()).join("\n");
+          hay = text;
+        }
+        const addr = text.match(/([A-Za-z][A-Za-z .]{1,40}?)\s*-\s*(\d{6})\s*,?\s*(IN-[A-Z]{2})?/);
+        const printed = text.match(/Printed at\s+(\d{3,4})\s*hrs,\s*([\d/]+)/i);
+        const boxNo = text.match(/Box\s*:?\s*(\d+)\s*\/\s*(\d+)/i);
+        const base = {
+          file: D.f.name, page: p, cell: ci, cells: boxes.length,
+          vendor: detectVendor(hay),
+          orderId: firstMatch(hay, APP.settings.rxOrder),
+          awb: firstMatch(hay, APP.settings.rxAwb),
+          boxNo: boxNo ? boxNo[1] + "/" + boxNo[2] : "",
+          customer: (text.match(/Name:\s*(.+)/i) || [, ""])[1].replace(/,\s*$/, "").trim(),
+          city: addr ? addr[1].trim() : "", pin: addr ? addr[2] : "", state: addr && addr[3] ? addr[3] : "",
+          printedOn: printed ? printed[2] : "", hasText: !!text.trim(), box: bx
+        };
+        const items = boxes.length === 1 ? extractItems(lines)
+          : extractItems(lines.filter(L => L.y >= bx.t - 2 && L.y <= bx.b + 2));
+        if (items.length) items.forEach(it => APP.labels.push(Object.assign({}, base, it)));
+        else APP.labels.push(Object.assign({}, base, { sku: "", product: "", qty: 1 }));
+        units++;
+      });
 
       done++;
       if (done % 4 === 0 || done === total) {
-        setProgress(done / total, `Reading labels — ${done} of ${total}`);
+        setProgress(done / total, `Reading labels — page ${done} of ${total}`);
         await sleep(0);
       }
     }
+    if (gridPages) log(`${D.f.name}: ${gridPages} sheet(s) carried more than one label — each was split out`, "ok");
     if (noText) log(`${D.f.name}: ${noText} page(s) have no text layer (scanned image) — vendor and order id could not be read`, "warn");
     D.doc.destroy();
   }
 
-  APP.lastStatus = `Done — ${total} labels read, ${APP.labels.length} line items`;
+  const labelCount = uniq(APP.labels.map(labelKey)).length;
+  APP.lastStatus = `Done — ${labelCount} labels on ${total} page(s), ${APP.labels.length} line items`;
   setProgress(1, APP.lastStatus);
-  log(`Processed ${total} labels, ${APP.labels.length} line items`, "ok");
+  log(`Processed ${total} pages into ${labelCount} labels, ${APP.labels.length} line items`, "ok");
   canonicaliseSkus();
   flagDuplicateLabels();
   APP.busy = false;
   render();
 }
 
-/* A duplicate is the SAME label printed twice — the same AWB (or order id when
-   there is no AWB) appearing on two different pages. Two identical item lines on
-   one label are a 2-piece shipment, not a duplicate. */
+/* A duplicate is the SAME label printed twice: the same AWB (or order id when
+   there is no AWB) on two different labels. Two identical item lines on one label
+   are a 2-piece shipment, and Box 1/3, 2/3 and 3/3 of one consignment share a
+   master number without being duplicates — the box number separates them. */
 function flagDuplicateLabels() {
-  const firstPage = new Map();
+  const firstSeen = new Map();
   APP.labels.forEach(l => {
-    const k = l.awb || l.orderId;
-    const page = l.file + "#" + l.page;
-    if (!k) { l.dup = false; return; }
-    if (!firstPage.has(k)) { firstPage.set(k, page); l.dup = false; }
-    else l.dup = firstPage.get(k) !== page;
+    const id = l.awb || l.orderId;
+    if (!id) { l.dup = false; return; }
+    const k = id + "|" + (l.boxNo || "");
+    const unit = labelKey(l);
+    if (!firstSeen.has(k)) { firstSeen.set(k, unit); l.dup = false; }
+    else l.dup = firstSeen.get(k) !== unit;
   });
-  const pages = uniq(APP.labels.filter(l => l.dup).map(l => l.file + "#" + l.page)).length;
-  if (pages) log(`${pages} label page(s) repeat an AWB that was already printed`, "warn");
+  const n = uniq(APP.labels.filter(l => l.dup).map(labelKey)).length;
+  if (n) log(`${n} label(s) repeat an AWB that was already printed`, "warn");
 }
 
 /* ---------------- order sheet ingestion ---------------- */
@@ -966,16 +1063,20 @@ async function buildCroppedPdf(sel) {
   const { PDFDocument } = PDFLib;
   const out = await PDFDocument.create();
   const byFile = new Map();
-  sel.forEach(s => { if (!byFile.has(s.file)) byFile.set(s.file, []); byFile.get(s.file).push(s.page); });
-  let done = 0, total = sel.length;
-  for (const [fname, pages] of byFile) {
+  sel.forEach(u => { if (!byFile.has(u.file)) byFile.set(u.file, []); byFile.get(u.file).push(u); });
+  let done = 0; const total = sel.length;
+  for (const [fname, units] of byFile) {
     const rec = APP.pdfFiles.find(f => f.name === fname);
     if (!rec) continue;
     const src = await PDFDocument.load(rec.bytes.slice(0), { ignoreEncryption: true });
-    const idx = pages.map(p => p - 1);
+    /* One output page per label, so a 3-up sheet is copied three times, each copy
+       cropped to its own label. */
+    const idx = units.map(u => u.page - 1);
     const copied = await out.copyPages(src, idx);
     copied.forEach((pg, i) => {
-      const box = rec.boxes[idx[i]];
+      const u = units[i];
+      const pageBoxes = rec.boxes[u.page - 1] || [];
+      const box = Array.isArray(pageBoxes) ? pageBoxes[u.cell || 0] : pageBoxes;
       if (box) {
         const H = pg.getHeight();
         const w = Math.max(10, box.r - box.l), h = Math.max(10, box.b - box.t);
@@ -994,7 +1095,7 @@ async function exportLabels(mode) {
   if (!APP.pdfFiles.length) { toast("Upload label PDFs first.", "warn"); return; }
   const labels = filteredLabels();
   const seen = new Set(), pages = [];
-  labels.forEach(l => { const k = l.file + "#" + l.page; if (!seen.has(k)) { seen.add(k); pages.push(l); } });
+  labels.forEach(l => { const k = labelKey(l); if (!seen.has(k)) { seen.add(k); pages.push(l); } });
   if (!pages.length) { toast("No labels match the current filters.", "warn"); return; }
   setBusy(true);
   try {
@@ -1016,7 +1117,7 @@ async function exportLabels(mode) {
       let i = 0;
       for (const p of pages) {
         const bytes = await buildCroppedPdf([p]);
-        const nm = (p.awb || p.orderId || `${p.file}_p${p.page}`).replace(/[^\w-]/g, "");
+        const nm = ((p.awb || p.orderId || `${p.file}_p${p.page}`) + (p.boxNo ? "_box" + p.boxNo.replace("/", "of") : (p.cells > 1 ? "_" + (p.cell + 1) : ""))).replace(/[^\w-]/g, "");
         zip.file(`${p.vendor.replace(/[^\w -]/g, "")}/${nm || "label_" + (i + 1)}.pdf`, bytes);
         i++; setProgress(i / pages.length, `Packing label ${i} of ${pages.length}`);
         if (i % 10 === 0) await sleep(0);
@@ -1137,7 +1238,7 @@ function progressCard() {
 /* ---------------- views ---------------- */
 function viewDash() {
   const L = filteredLabels(), O = filteredOrders();
-  const labelPages = uniq(L.map(l => l.file + "#" + l.page)).length;
+  const labelPages = uniq(L.map(labelKey)).length;
   const overdue = O.filter(o => o.lateState === "overdue"), today = O.filter(o => o.lateState === "today");
   const oq = sum(overdue, o => o.qty), tq = sum(today, o => o.qty), allq = sum(O, o => o.qty);
   const vend = {}; L.forEach(l => vend[l.vendor] = (vend[l.vendor] || 0) + (l.qty || 0));
@@ -1238,16 +1339,16 @@ function drawDash() {
 /* ----- labels ----- */
 function viewLabels() {
   const L = filteredLabels();
-  const pages = uniq(L.map(l => l.file + "#" + l.page)).length;
+  const pages = uniq(L.map(labelKey)).length;
   const noText = APP.labels.filter(l => !l.hasText).length;
-  const byV = {}; L.forEach(l => { const k = l.file + "#" + l.page; (byV[l.vendor] = byV[l.vendor] || new Set()).add(k); });
+  const byV = {}; L.forEach(l => { (byV[l.vendor] = byV[l.vendor] || new Set()).add(labelKey(l)); });
   const s = APP.settings;
   return `
   ${dropzone("dzPdf", "Drop shipping-label PDFs here", "Or click to choose files. Several files at once is fine — they are merged into one run.", "application/pdf,.pdf")}
   ${progressCard()}
   ${APP.pdfFiles.length ? `
   <div class="kpis">
-    <div class="kpi pri"><span class="k">Labels</span><span class="v">${n0(pages)}</span><span class="d">${n0(APP.pdfFiles.length)} file(s)</span></div>
+    <div class="kpi pri"><span class="k">Labels</span><span class="v">${n0(pages)}</span><span class="d">${n0(sum(APP.pdfFiles, f => f.pages))} page(s) in ${n0(APP.pdfFiles.length)} file(s)</span></div>
     <div class="kpi"><span class="k">Line items</span><span class="v">${n0(L.length)}</span><span class="d">${n0(sum(L, l => l.qty))} units</span></div>
     <div class="kpi ${noText ? "warn" : "ok"}"><span class="k">Readable</span><span class="v">${n0(APP.labels.length - noText)}</span><span class="d">${noText ? n0(noText) + " without a text layer" : "every label parsed"}</span></div>
     <div class="kpi ${APP.labels.some(l => l.dup) ? "crit" : "ok"}"><span class="k">Duplicates</span><span class="v">${n0(APP.labels.filter(l => l.dup).length)}</span><span class="d">same AWB printed on two pages</span></div>
@@ -1266,6 +1367,9 @@ function viewLabels() {
         </select></label>
       <label class="fld" style="flex:0 1 110px">Padding (pt)<input type="number" id="cropPad" min="0" max="40" value="${s.cropPad}"></label>
       <label class="fld" style="flex:0 1 150px">Block gap (pt)<input type="number" id="gapTh" min="3" max="60" value="${s.gapThreshold}"></label>
+      <label class="fld" style="flex:1 1 210px">Sheets with several labels
+        <select id="splitGrid"><option value="1"${s.splitGrid ? " selected" : ""}>Split each one onto its own page</option>
+        <option value="0"${!s.splitGrid ? " selected" : ""}>Keep the sheet whole</option></select></label>
       <label class="fld" style="flex:1 1 200px">Speed
         <select id="sampleDet"><option value="1"${s.sampleDetect ? " selected" : ""}>Fast — reuse geometry when pages match</option>
         <option value="0"${!s.sampleDetect ? " selected" : ""}>Thorough — measure every page</option></select></label>
@@ -1295,10 +1399,12 @@ function viewLabels() {
     <button class="btn sec sm" id="xLabelsCsv" type="button">CSV</button></div></div>
     <div class="card-b flush">${table([
       { t: "Vendor", k: "vendor", v: r => r.vendor }, { t: "Order ID", k: "orderId", v: r => r.orderId },
-      { t: "AWB", k: "awb", v: r => r.awb }, { t: "SKU", k: "sku", v: r => r.sku },
+      { t: "AWB", k: "awb", v: r => r.awb }, { t: "Box", k: "boxNo", v: r => r.boxNo || "" },
+      { t: "SKU", k: "sku", v: r => r.sku },
       { t: "Product", k: "product", v: r => r.product, trunc: 1 }, { t: "Qty", k: "qty", n: 1, v: r => r.qty },
       { t: "Customer", k: "customer", v: r => r.customer }, { t: "City", k: "city", v: r => r.city },
-      { t: "PIN", k: "pin", v: r => r.pin }, { t: "Source", k: "src", v: r => r.file + " p." + r.page }],
+      { t: "PIN", k: "pin", v: r => r.pin },
+      { t: "Source", k: "src", v: r => r.file + " p." + r.page + (r.cells > 1 ? " · " + (r.cell + 1) + "/" + r.cells : "") }],
       L.slice(0, 500), null, r => r.dup ? "r-crit" : "")}
       ${L.length > 500 ? `<div class="small muted" style="padding:9px 12px">Showing the first 500 of ${n0(L.length)} rows. The export contains all of them.</div>` : ""}
     </div></div>` : `<div class="card"><div class="empty"><h4>No labels loaded</h4>
@@ -1307,7 +1413,7 @@ function viewLabels() {
 async function drawLabelPreviews() {
   const host = $("#pvHost"); if (!host) return;
   const L = filteredLabels(); const seen = new Set(); const pages = [];
-  L.forEach(l => { const k = l.file + "#" + l.page; if (!seen.has(k) && pages.length < 8) { seen.add(k); pages.push(l); } });
+  L.forEach(l => { const k = labelKey(l); if (!seen.has(k) && pages.length < 8) { seen.add(k); pages.push(l); } });
   if (!pages.length) { host.innerHTML = `<span class="small muted">No labels to preview.</span>`; return; }
   host.innerHTML = "";
   for (const p of pages) {
@@ -1315,7 +1421,8 @@ async function drawLabelPreviews() {
     try {
       const doc = await pdfjsLib.getDocument({ data: rec.bytes.slice(0), disableFontFace: true }).promise;
       const page = await doc.getPage(p.page);
-      const box = rec.boxes[p.page - 1];
+      const pb = rec.boxes[p.page - 1];
+      const box = Array.isArray(pb) ? pb[p.cell || 0] : pb;
       const scale = 1.4;
       const vp = page.getViewport({ scale });
       const cv = document.createElement("canvas");
@@ -1329,7 +1436,7 @@ async function drawLabelPreviews() {
       cell.className = "pv";
       cell.appendChild(cv);
       const cap = document.createElement("div");
-      cap.className = "cap"; cap.textContent = `${p.vendor} · ${p.awb || p.orderId || "p." + p.page}`;
+      cap.className = "cap"; cap.textContent = `${p.vendor} · ${p.awb || p.orderId || "p." + p.page}${p.boxNo ? " · box " + p.boxNo : ""}`;
       cell.appendChild(cap);
       host.appendChild(cell);
       doc.destroy();
@@ -1622,7 +1729,7 @@ function viewSettings() {
     <div class="card-b"><div class="row">
       <label class="fld" style="flex:1 1 280px">Order ID<input id="rxOrder" class="mono" value="${esc(s.rxOrder)}"></label>
       <label class="fld" style="flex:1 1 280px">AWB / tracking<input id="rxAwb" class="mono" value="${esc(s.rxAwb)}"></label>
-    </div><p class="small muted" style="margin:9px 0 0">Changing these re-reads the labels already loaded, from memory — nothing is uploaded again.</p></div></div>
+    </div><p class="small muted" style="margin:9px 0 0">Separate alternatives with <span class="mono">||</span> and they are tried in that order, so put the most trustworthy one first — that is how <span class="mono">Master:</span> beats <span class="mono">LRN:</span> on a Delhivery B2B box label. A single <span class="mono">|</span> inside one alternative is ordinary regex.<br>Changing these re-reads the labels already loaded, from memory — nothing is uploaded again.</p></div></div>
 
   <div class="card"><div class="card-h"><h3>About this file</h3></div>
     <div class="card-b small muted">
@@ -1832,7 +1939,7 @@ function loadSample() {
     const city = cities[Math.floor(rnd() * cities.length)];
     const rec = { vendor: v, orderId: oid, awb, sku: sk[0], product: sk[1], qty,
       customer: "Sample Customer " + (i + 1), city, pin: String(400000 + Math.floor(rnd() * 99999)), state: "IN-MH",
-      file: "sample.pdf", page: i + 1, hasText: true, dup: false, box: null };
+      file: "sample.pdf", page: i + 1, cell: 0, cells: 1, boxNo: "", hasText: true, dup: false, box: null };
     if (i < 78) labels.push(rec);
     orders.push({ src: "sample-orders.csv", orderId: oid, vendor: v, sku: sk[0], product: sk[1], qty,
       orderDate: new Date(d.getTime() - 86400000 * 2), dispatchDate: d, status: "Ready to dispatch",
@@ -1850,7 +1957,7 @@ function render() {
   $("#pgTitle").textContent = tab.title;
   $("#pgSub").textContent = tab.sub;
   $("#nav").innerHTML = TABS.map(t => {
-    const c = t.id === "labels" ? uniq(APP.labels.map(l => l.file + "#" + l.page)).length
+    const c = t.id === "labels" ? uniq(APP.labels.map(labelKey)).length
       : t.id === "ageing" ? APP.orders.length
       : t.id === "except" ? (APP.labels.filter(l => !l.hasText || l.dup || !l.orderId).length + APP.orders.filter(o => !o.dispatchDate || o.dup).length)
       : t.id === "recon" ? (APP.labels.length && APP.orders.length ? reconcile().orderOnly.length : 0) : 0;
@@ -1870,7 +1977,7 @@ function render() {
   $("#gSheet").onchange = e => { if (e.target.files.length) { APP.tab = "ageing"; render(); ingestSheets(Array.from(e.target.files)); } };
 
   $("#railStat").textContent = APP.isSample ? "Sample data loaded"
-    : `${n0(uniq(APP.labels.map(l => l.file + "#" + l.page)).length)} labels · ${n0(APP.orders.length)} order rows`;
+    : `${n0(uniq(APP.labels.map(labelKey)).length)} labels · ${n0(APP.orders.length)} order rows`;
 
   const m = $("#main");
   m.innerHTML = `<div id="toastHost" hidden></div>` +
@@ -1895,6 +2002,7 @@ function render() {
       $("#cropPad").onchange = e => APP.settings.cropPad = +e.target.value || 0;
       $("#gapTh").onchange = e => APP.settings.gapThreshold = +e.target.value || 10;
       $("#sampleDet").onchange = e => APP.settings.sampleDetect = e.target.value === "1";
+      const sg = $("#splitGrid"); if (sg) sg.onchange = e => APP.settings.splitGrid = e.target.value === "1";
       ["l", "t", "r", "b"].forEach(k => { const el = $("#mb" + k.toUpperCase()); if (el) el.onchange = () => APP.settings.manualBox[k] = +el.value || 0; });
       const rd = $("#reDetect"); if (rd) rd.onclick = retagLabels;
     }
@@ -1902,11 +2010,11 @@ function render() {
     const dv = $("#dlVend"); if (dv) dv.onclick = () => exportLabels("vendor");
     const de = $("#dlEach"); if (de) de.onclick = () => exportLabels("individual");
     const xl = $("#xLabels"); if (xl) xl.onclick = () => saveWorkbook([{ name: "Label Detail",
-      rows: [["Vendor", "Order ID", "AWB", "SKU", "Product", "Qty", "Customer", "City", "PIN", "State", "File", "Page", "Duplicate"]]
-        .concat(filteredLabels().map(l => [l.vendor, l.orderId, l.awb, l.sku, l.product, l.qty, l.customer, l.city, l.pin, l.state, l.file, l.page, l.dup ? "YES" : ""])) }], "Label_Data.xlsx");
+      rows: [["Vendor", "Order ID", "AWB", "Box", "SKU", "Product", "Qty", "Customer", "City", "PIN", "State", "File", "Page", "Label on page", "Duplicate"]]
+        .concat(filteredLabels().map(l => [l.vendor, l.orderId, l.awb, l.boxNo || "", l.sku, l.product, l.qty, l.customer, l.city, l.pin, l.state, l.file, l.page, l.cells > 1 ? (l.cell + 1) + " of " + l.cells : "", l.dup ? "YES" : ""])) }], "Label_Data.xlsx");
     const xc = $("#xLabelsCsv"); if (xc) xc.onclick = () => saveCsv(
-      [["Vendor", "Order ID", "AWB", "SKU", "Product", "Qty", "Customer", "City", "PIN", "State", "File", "Page"]]
-        .concat(filteredLabels().map(l => [l.vendor, l.orderId, l.awb, l.sku, l.product, l.qty, l.customer, l.city, l.pin, l.state, l.file, l.page])), "Label_Data.csv");
+      [["Vendor", "Order ID", "AWB", "Box", "SKU", "Product", "Qty", "Customer", "City", "PIN", "State", "File", "Page"]]
+        .concat(filteredLabels().map(l => [l.vendor, l.orderId, l.awb, l.boxNo || "", l.sku, l.product, l.qty, l.customer, l.city, l.pin, l.state, l.file, l.page])), "Label_Data.csv");
     if (APP.pdfFiles.length) drawLabelPreviews();
   }
 }
@@ -1956,7 +2064,7 @@ function init() {
 }
 /* A small handle for scripted checks and support: window.ShipDesk.APP holds the
    parsed data, and the parsing functions can be called directly. */
-window.ShipDesk = { APP, detectBox, parseDate, reconcile, render, ingestPdfs, ingestSheets, boxKey };
+window.ShipDesk = { APP, detectBoxes, parseDate, reconcile, render, ingestPdfs, ingestSheets, boxKey, labelKey };
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init); else init();
 })();
